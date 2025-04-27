@@ -4,14 +4,15 @@ from typing import List, Tuple, Set, Optional
 class Minesweeper:
     MINE = -1
 
-    def __init__(self, grid_size=10, num_mines=15, seed=None):
-        self.grid_size = grid_size
+    def __init__(self, height=10, width=10, num_mines=15, seed=None):
+        self.height = height
+        self.width = width
         self.num_mines = num_mines
         self.rng = random.Random(seed)
         self.reset()
 
     def reset(self):
-        self.board = [[0 for _ in range(self.grid_size)] for _ in range(self.grid_size)]
+        self.board = [[0 for _ in range(self.width)] for _ in range(self.height)]
         self.revealed = set()
         self.flagged = set()
         self.first_move = True
@@ -20,30 +21,28 @@ class Minesweeper:
 
     def place_mines(self, first_click_pos: Tuple[int, int]):
         # Place mines avoiding first click and its neighbors
-        rows, cols = self.grid_size, self.grid_size
         safe_cells = set()
         fr, fc = first_click_pos
-        for r in range(max(0, fr-1), min(rows, fr+2)):
-            for c in range(max(0, fc-1), min(cols, fc+2)):
+        for r in range(max(0, fr-1), min(self.height, fr+2)):
+            for c in range(max(0, fc-1), min(self.width, fc+2)):
                 safe_cells.add((r, c))
         mines_placed = 0
         while mines_placed < self.num_mines:
-            row = self.rng.randint(0, rows - 1)
-            col = self.rng.randint(0, cols - 1)
+            row = self.rng.randint(0, self.height - 1)
+            col = self.rng.randint(0, self.width - 1)
             if (row, col) not in safe_cells and self.board[row][col] != self.MINE:
                 self.board[row][col] = self.MINE
                 mines_placed += 1
         self.calculate_numbers()
 
     def calculate_numbers(self):
-        rows, cols = self.grid_size, self.grid_size
-        for row in range(rows):
-            for col in range(cols):
+        for row in range(self.height):
+            for col in range(self.width):
                 if self.board[row][col] == self.MINE:
                     continue
                 count = 0
-                for r in range(max(0, row-1), min(rows, row+2)):
-                    for c in range(max(0, col-1), min(cols, col+2)):
+                for r in range(max(0, row-1), min(self.height, row+2)):
+                    for c in range(max(0, col-1), min(self.width, col+2)):
                         if (r, c) != (row, col) and self.board[r][c] == self.MINE:
                             count += 1
                 self.board[row][col] = count
@@ -67,12 +66,12 @@ class Minesweeper:
         return False
 
     def _reveal_cell(self, row: int, col: int):
-        if (row, col) in self.revealed or row < 0 or col < 0 or row >= self.grid_size or col >= self.grid_size:
+        if (row, col) in self.revealed or row < 0 or col < 0 or row >= self.height or col >= self.width:
             return
         self.revealed.add((row, col))
         if self.board[row][col] == 0:
-            for r in range(max(0, row-1), min(self.grid_size, row+2)):
-                for c in range(max(0, col-1), min(self.grid_size, col+2)):
+            for r in range(max(0, row-1), min(self.height, row+2)):
+                for c in range(max(0, col-1), min(self.width, col+2)):
                     if (r, c) != (row, col):
                         self._reveal_cell(r, c)
 
@@ -92,7 +91,9 @@ class Minesweeper:
             'board': [row[:] for row in self.board],
             'game_over': self.game_over,
             'win': self.win,
-            'first_move': self.first_move
+            'first_move': self.first_move,
+            'height': self.height,
+            'width': self.width
         }
 
     def set_state(self, state: dict):
@@ -103,16 +104,18 @@ class Minesweeper:
         self.game_over = state['game_over']
         self.win = state['win']
         self.first_move = state['first_move']
+        self.height = state.get('height', len(self.board))
+        self.width = state.get('width', len(self.board[0]) if self.board else 0)
 
     def check_win(self) -> bool:
-        total_cells = self.grid_size * self.grid_size
+        total_cells = self.height * self.width
         return len(self.revealed) == total_cells - self.num_mines
 
     # Text interface for debug/AI
     def print_board(self, reveal_all=False):
-        for r in range(self.grid_size):
+        for r in range(self.height):
             line = ''
-            for c in range(self.grid_size):
+            for c in range(self.width):
                 if reveal_all:
                     v = self.board[r][c]
                 else:
@@ -145,10 +148,12 @@ class Minesweeper:
             return
 
         # --- GUI constants ---
-        GRID_SIZE = self.grid_size
+        GRID_HEIGHT = self.height
+        GRID_WIDTH = self.width
         CELL_SIZE = 30
         MARGIN = 2
-        WINDOW_SIZE = GRID_SIZE * (CELL_SIZE + MARGIN) + MARGIN
+        WINDOW_WIDTH = GRID_WIDTH * (CELL_SIZE + MARGIN) + MARGIN
+        WINDOW_HEIGHT = GRID_HEIGHT * (CELL_SIZE + MARGIN) + MARGIN + 50
         NUM_MINES = self.num_mines
 
         WHITE = (255, 255, 255)
@@ -174,13 +179,13 @@ class Minesweeper:
         }
 
         pygame.init()
-        screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE + 50))
+        screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
         pygame.display.set_caption("Minesweeper (AI-ready)")
 
         font = pygame.font.Font(None, 24)
         def draw_board():
-            for row in range(GRID_SIZE):
-                for col in range(GRID_SIZE):
+            for row in range(GRID_HEIGHT):
+                for col in range(GRID_WIDTH):
                     x = col * (CELL_SIZE + MARGIN) + MARGIN
                     y = row * (CELL_SIZE + MARGIN) + MARGIN
                     is_revealed = (row, col) in self.revealed
@@ -218,7 +223,7 @@ class Minesweeper:
         def draw_status():
             font2 = pygame.font.Font(None, 30)
             flag_text = font2.render(f"Mines: {NUM_MINES-len(self.flagged)}", True, BLACK)
-            screen.blit(flag_text, (10, WINDOW_SIZE + 10))
+            screen.blit(flag_text, (10, WINDOW_HEIGHT - 40))
             status_text = None
             if self.game_over:
                 if self.win:
@@ -226,7 +231,7 @@ class Minesweeper:
                 else:
                     status_text = font2.render("Game Over", True, RED)
             if status_text:
-                screen.blit(status_text, (WINDOW_SIZE - status_text.get_width() - 10, WINDOW_SIZE + 10))
+                screen.blit(status_text, (WINDOW_WIDTH - status_text.get_width() - 10, WINDOW_HEIGHT - 40))
 
         running = True
         while running:
@@ -237,7 +242,7 @@ class Minesweeper:
                     if event.type == pygame.MOUSEBUTTONDOWN:
                         col = event.pos[0] // (CELL_SIZE + MARGIN)
                         row = event.pos[1] // (CELL_SIZE + MARGIN)
-                        if row >= GRID_SIZE or col >= GRID_SIZE:
+                        if row >= GRID_HEIGHT or col >= GRID_WIDTH:
                             continue
                         if event.button == 1:
                             self.reveal(row, col)
@@ -250,5 +255,5 @@ class Minesweeper:
         pygame.quit()
 
 if __name__ == "__main__":
-    env = Minesweeper(grid_size=8, num_mines=15)
-    env.play_human()  
+    env = Minesweeper(height=16, width=30, num_mines=99)
+    env.play_human()
