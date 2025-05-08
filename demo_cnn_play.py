@@ -3,7 +3,7 @@ import torch
 import time
 import sys
 import argparse
-from minesweeper import Minesweeper  # Make sure this is available as in your previous script.
+from minesweeper import Minesweeper  # Must have patched win logic.
 
 # --------- CNN AGENT NETWORK ---------
 class CNNAgentNet:
@@ -29,30 +29,24 @@ class CNNAgentNet:
     def forward(self, obs):
         # obs: [1, H, W, 3] tensor
         x = obs.permute(0, 3, 1, 2)  # [1, 3, H, W]
-        # Conv1
         x = torch.nn.functional.conv2d(x, self.conv1_w, self.conv1_b, padding=1)
         x = torch.relu(x)
-        # Conv2
         x = torch.nn.functional.conv2d(x, self.conv2_w, self.conv2_b, padding=1)
         x = torch.relu(x)
-        # Output
         x = torch.nn.functional.conv2d(x, self.out_w, self.out_b)
-        x = x.permute(0,2,3,1)  # [1, H, W, 2]
+        x = x.permute(0, 2, 3, 1)  # [1, H, W, 2]
         return x[0]  # [H, W, 2]
 
     def act(self, obs, mask_reveal, mask_flag):
-        # obs: [1, H, W, 3]
         logits = self.forward(obs)  # [H, W, 2]
         logits_reveal = logits[..., 0].clone()
         logits_flag = logits[..., 1].clone()
-        # Mask invalid actions
         logits_reveal[~mask_reveal] = float('-inf')
         logits_flag[~mask_flag] = float('-inf')
-        # Flatten for argmax
         flat_reveal = logits_reveal.flatten()
         flat_flag = logits_flag.flatten()
         all_scores = torch.stack([flat_reveal, flat_flag], dim=1)  # [N,2]
-        flat_idx = torch.argmax(all_scores)  # index in [N*2]
+        flat_idx = torch.argmax(all_scores)
         cell_idx = flat_idx // 2
         action_type = flat_idx % 2
         r = cell_idx // self.width
@@ -67,14 +61,13 @@ def get_cnn_agent_obs(state, height, width):
     for r in range(height):
         for c in range(width):
             if (r, c) in state['revealed']:
-                clue = state['board'][r][c] / 8.0  # normalized 0..1, mines as -1/8
+                clue = state['board'][r][c] / 8.0  # normalized, mines as -1/8
                 revealed = 1.0
                 flagged = 1.0 if (r, c) in state['flagged'] else 0.0
             else:
                 clue = 0.0
                 revealed = 0.0
                 flagged = 1.0 if (r, c) in state['flagged'] else 0.0
-
             obs[0, r, c, 0] = clue
             obs[0, r, c, 1] = revealed
             obs[0, r, c, 2] = flagged
@@ -86,22 +79,19 @@ def get_cnn_agent_obs(state, height, width):
 # --------- DEMO GUI LOOP ---------
 def gui_demo(args):
     genome = np.load(args.genome)
-    env = Minesweeper(height=args.height, width=args.width, num_mines=args.mines, seed=args.seed)
-    agent = CNNAgentNet(genome, args.height, args.width)
+    win_count = 0
+    loss_count = 0
 
-    # Import pygame
     try:
         import pygame
     except ImportError:
         print("pygame is not installed.")
         sys.exit(1)
 
-    GRID_HEIGHT = env.height
-    GRID_WIDTH = env.width
     CELL_SIZE = 30
     MARGIN = 2
-    WINDOW_WIDTH = GRID_WIDTH * (CELL_SIZE + MARGIN) + MARGIN
-    WINDOW_HEIGHT = GRID_HEIGHT * (CELL_SIZE + MARGIN) + MARGIN + 50
+    WINDOW_WIDTH = args.width * (CELL_SIZE + MARGIN) + MARGIN
+    WINDOW_HEIGHT = args.height * (CELL_SIZE + MARGIN) + MARGIN + 100
 
     WHITE = (255, 255, 255)
     BLACK = (0, 0, 0)
@@ -129,10 +119,16 @@ def gui_demo(args):
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
     pygame.display.set_caption("Minesweeper CNN AI Demo (Step-by-Step)")
     font = pygame.font.Font(None, 24)
+    font2 = pygame.font.Font(None, 30)
 
-    def draw_board():
-        for row in range(GRID_HEIGHT):
-            for col in range(GRID_WIDTH):
+    def new_game():
+        env = Minesweeper(height=args.height, width=args.width, num_mines=args.mines, seed=args.seed)
+        agent = CNNAgentNet(genome, args.height, args.width)
+        return env, agent
+
+    def draw_board(env):
+        for row in range(env.height):
+            for col in range(env.width):
                 x = col * (CELL_SIZE + MARGIN) + MARGIN
                 y = row * (CELL_SIZE + MARGIN) + MARGIN
                 is_revealed = (row, col) in env.revealed
@@ -164,8 +160,7 @@ def gui_demo(args):
                     pygame.draw.line(screen, RED, (x + 5, y + 5), (x + CELL_SIZE - 5, y + CELL_SIZE - 5), 2)
                     pygame.draw.line(screen, RED, (x + CELL_SIZE - 5, y + 5), (x + 5, y + CELL_SIZE - 5), 2)
 
-    def draw_status():
-        font2 = pygame.font.Font(None, 30)
+    def draw_status(env, win_count, loss_count):
         flag_text = font2.render(f"Mines: {env.num_mines-len(env.flagged)}", True, BLACK)
         screen.blit(flag_text, (10, WINDOW_HEIGHT - 40))
         status_text = None
@@ -176,11 +171,17 @@ def gui_demo(args):
                 status_text = font2.render("AI Lost!", True, RED)
         if status_text:
             screen.blit(status_text, (WINDOW_WIDTH - status_text.get_width() - 10, WINDOW_HEIGHT - 40))
+        total_games = win_count + loss_count
+        win_rate = (win_count / total_games * 100) if total_games > 0 else 0.0
+        stats_text = font2.render(f"Wins: {win_count}  Losses: {loss_count}  Win Rate: {win_rate:.1f}%", True, BLACK)
+        screen.blit(stats_text, (10, WINDOW_HEIGHT - 80))
 
+    env, agent = new_game()
     running = True
     step_mode = True
     last_step_time = 0
     step_delay = args.delay
+    game_reset_time = None
 
     while running:
         for event in pygame.event.get():
@@ -188,26 +189,36 @@ def gui_demo(args):
                 running = False
 
         now = time.time()
-        if step_mode and not env.game_over and now - last_step_time > step_delay:
-            state = env.get_state()
-            obs, mask_reveal, mask_flag = get_cnn_agent_obs(state, args.height, args.width)
-            if mask_reveal.any() or mask_flag.any():
-                r, c, action_type = agent.act(obs, mask_reveal, mask_flag)
-                if action_type == 0:
-                    env.reveal(r, c)
+
+        if env.game_over:
+            if game_reset_time is None:
+                game_reset_time = now
+                if env.win:
+                    win_count += 1
                 else:
-                    env.flag(r, c)
+                    loss_count += 1
+            elif now - game_reset_time > 1.0:
+                env, agent = new_game()
+                game_reset_time = None
                 last_step_time = now
-            else:
-                break
+        else:
+            if step_mode and now - last_step_time > step_delay:
+                state = env.get_state()
+                obs, mask_reveal, mask_flag = get_cnn_agent_obs(state, args.height, args.width)
+                if mask_reveal.any() or mask_flag.any():
+                    r, c, action_type = agent.act(obs, mask_reveal, mask_flag)
+                    if action_type == 0:
+                        env.reveal(r, c)
+                    else:
+                        env.flag(r, c)
+                    last_step_time = now
 
         screen.fill(DARK_GRAY)
-        draw_board()
-        draw_status()
+        draw_board(env)
+        draw_status(env, win_count, loss_count)
         pygame.display.flip()
         pygame.time.wait(20)
 
-    pygame.time.wait(2000)
     pygame.quit()
 
 if __name__ == "__main__":

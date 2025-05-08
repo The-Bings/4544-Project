@@ -1,6 +1,49 @@
 import argparse
 import numpy as np
 import torch
+import os
+
+from torch_geometric.data import Data, Batch
+from torch_geometric.nn import GCNConv
+
+class MinesweeperGNN(torch.nn.Module):
+    def __init__(self, node_feat_dim=3, hidden_dim=32, out_dim=2):
+        super().__init__()
+        self.conv1 = GCNConv(node_feat_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.out = torch.nn.Linear(hidden_dim, out_dim)
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = torch.relu(self.conv1(x, edge_index))
+        x = torch.relu(self.conv2(x, edge_index))
+        out = self.out(x)
+        return out
+
+def build_board_graph(board, revealed, flagged, device):
+    H, W = board.shape
+    node_feats = []
+    edge_index = [[], []]
+    idx = lambda r, c: r * W + c
+    for r in range(H):
+        for c in range(W):
+            f = [
+                float(revealed[r, c]),
+                float(flagged[r, c]),
+                float(board[r, c]) / 8.0 if revealed[r, c] else 0.0
+            ]
+            node_feats.append(f)
+            for dr in [-1, 0, 1]:
+                for dc in [-1, 0, 1]:
+                    if dr == 0 and dc == 0:
+                        continue
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < H and 0 <= nc < W:
+                        edge_index[0].append(idx(r, c))
+                        edge_index[1].append(idx(nr, nc))
+    x = torch.tensor(node_feats, dtype=torch.float32, device=device)
+    edge_index = torch.tensor(edge_index, dtype=torch.long, device=device)
+    return Data(x=x, edge_index=edge_index)
 
 def setup_boards(pop_size, H, W, num_mines, device):
     boards = torch.zeros((pop_size, H, W), dtype=torch.int8, device=device)
@@ -26,74 +69,52 @@ def first_click(boards, revealed, flagged):
             revealed[i, r[i], c[i]] = True
     return r, c
 
-def cnn_agent_forward(obs, genomes, H, W, hidden=16):
-    # obs: [B, H, W, 3]
-    B = obs.shape[0]
-    idx = 0
-    conv1_w = genomes[:, idx:idx+3*3*3*hidden].reshape(B, hidden, 3, 3, 3)
-    idx += 3*3*3*hidden
-    conv1_b = genomes[:, idx:idx+hidden]  # shape [B, hidden]
-    idx += hidden
-    conv2_w = genomes[:, idx:idx+hidden*hidden*3*3].reshape(B, hidden, hidden, 3, 3)
-    idx += hidden*hidden*3*3
-    conv2_b = genomes[:, idx:idx+hidden]  # shape [B, hidden]
-    idx += hidden
-    out_w = genomes[:, idx:idx+hidden*2].reshape(B, 2, hidden, 1, 1)
-    idx += hidden*2
-    out_b = genomes[:, idx:idx+2]  # shape [B, 2]
+def gnn_agent_forward(gnn, boards, revealed, flagged, device):
+    B, H, W = boards.shape
+    batch_graphs = []
+    for i in range(B):
+        data = build_board_graph(boards[i], revealed[i], flagged[i], device)
+        batch_graphs.append(data)
+    batch = Batch.from_data_list(batch_graphs)
+    gnn.eval()
+    with torch.no_grad():
+        logits = gnn(batch)  # [sum_nodes, 2]
+    return logits, batch
 
-    x = obs.permute(0, 3, 1, 2) # [B, 3, H, W]
-    # Conv1
-    x = torch.stack([
-        torch.nn.functional.conv2d(
-            x[i:i+1], conv1_w[i], conv1_b[i], padding=1
-        ) for i in range(B)
-    ], dim=0).squeeze(1)
-    x = torch.nn.functional.leaky_relu(x, negative_slope=0.01)
-    # Conv2
-    x = torch.stack([
-        torch.nn.functional.conv2d(
-            x[i:i+1], conv2_w[i], conv2_b[i], padding=1
-        ) for i in range(B)
-    ], dim=0).squeeze(1)
-    x = torch.nn.functional.leaky_relu(x,negative_slope=0.01)
-    # Output 1x1 conv
-    x = torch.stack([
-        torch.nn.functional.conv2d(
-            x[i:i+1], out_w[i], out_b[i]
-        ) for i in range(B)
-    ], dim=0).squeeze(1)
-    x = x.permute(0, 2, 3, 1) # [B, H, W, 2]
-    return x
-
-def cnn_agent(boards, revealed, flagged, genomes, H, W, hidden=16):
-    B = boards.shape[0]
-    # --- Only provide the clue for revealed cells, else 0 ---
-    clues = torch.where(revealed, boards.float() / 8.0, torch.zeros_like(boards.float()))
-    obs = torch.stack([
-        clues,
-        revealed.float(),
-        flagged.float()
-    ], dim=-1)  # [B, H, W, 3]
-    logits = cnn_agent_forward(obs, genomes, H, W, hidden=hidden)  # [B, H, W, 2]
-    mask_reveal = ~(revealed | flagged)
-    mask_flag = ~revealed
-    logits_reveal = logits[..., 0].masked_fill(~mask_reveal, float('-inf'))
-    logits_flag = logits[..., 1].masked_fill(~mask_flag, float('-inf'))
-    cat_logits = torch.stack([logits_reveal, logits_flag], dim=-1)  # [B, H, W, 2]
-    cat_logits_flat = cat_logits.view(B, -1)
-    max_vals = cat_logits_flat.max(dim=1)[0].unsqueeze(1)
-    is_max = (cat_logits_flat == max_vals)
-    action_indices = torch.arange(cat_logits_flat.shape[1], device=cat_logits.device)
-    is_reveal = (action_indices % 2 == 0).unsqueeze(0).expand(B, -1)
-    prefer_reveal = is_max & is_reveal
-    fallback = is_max.float().argmax(dim=1)
-    flat_idx = torch.where(prefer_reveal.any(dim=1), prefer_reveal.float().argmax(dim=1), fallback)
-    action_type = flat_idx % 2
-    cell_idx = flat_idx // 2
-    r = cell_idx // W
-    c = cell_idx % W
-    return r, c, action_type
+def gnn_agent(gnn, boards, revealed, flagged, device):
+    B, H, W = boards.shape
+    out = []
+    logits, batch = gnn_agent_forward(gnn, boards, revealed, flagged, device)
+    node_ptr = batch.ptr.cpu().numpy()
+    for i in range(B):
+        start, end = node_ptr[i], node_ptr[i + 1]
+        lgi = logits[start:end]
+        mask_reveal = ~(revealed[i].flatten() | flagged[i].flatten())
+        mask_flag = ~revealed[i].flatten()
+        logits_reveal = lgi[:, 0].clone()
+        logits_flag = lgi[:, 1].clone()
+        logits_reveal[~mask_reveal] = -float('inf')
+        logits_flag[~mask_flag] = -float('inf')
+        cat_logits = torch.stack([logits_reveal, logits_flag], dim=1)
+        max_val = cat_logits.max()
+        is_max = (cat_logits == max_val)
+        prefer_reveal = is_max[:, 0]
+        if prefer_reveal.any():
+            flat_idx = prefer_reveal.float().argmax().item()
+            action_type = 0
+        else:
+            fallback = cat_logits.view(-1).argmax()
+            flat_idx = (fallback // 2).item()
+            action_type = (fallback % 2).item()
+        r = int(flat_idx // W)
+        c = int(flat_idx % W)
+        out.append((r, c, action_type))
+    r, c, action_type = zip(*out)
+    return (
+        torch.tensor(r, device=device),
+        torch.tensor(c, device=device),
+        torch.tensor(action_type, device=device)
+    )
 
 def check_win(revealed, flagged, boards, num_mines):
     is_mine = (boards == -1)
@@ -103,16 +124,18 @@ def check_win(revealed, flagged, boards, num_mines):
     win = (all_safe_revealed | all_mines_flagged) & (~too_many_flags)
     return win, too_many_flags
 
-def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, eval_games=50):
-    """
-    For each genome, evaluate it on `eval_games` different random boards.
-    Accumulate fitness and win statistics.
-    """
-    pop_size = genomes.shape[0]
+def run_generation(pop_state_dicts, H, W, num_mines, max_steps, device, hidden_dim=32, eval_games=50):
+    pop_size = len(pop_state_dicts)
     total_cells = H * W
     num_safe_cells = total_cells - num_mines
 
-    # Accumulators for all statistics
+    gnn_list = []
+    for i in range(pop_size):
+        gnn = MinesweeperGNN(node_feat_dim=3, hidden_dim=hidden_dim)
+        gnn.load_state_dict(pop_state_dicts[i])
+        gnn = gnn.to(device)
+        gnn_list.append(gnn)
+
     fitness_sum = torch.zeros(pop_size, dtype=torch.float32, device=device)
     wins_sum = torch.zeros(pop_size, dtype=torch.float32, device=device)
     revealed_sum = torch.zeros(pop_size, H, W, dtype=torch.float32, device=device)
@@ -134,19 +157,31 @@ def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, e
         unflag_count = torch.zeros(pop_size, dtype=torch.int32, device=device)
         too_many_flags_vec = torch.zeros(pop_size, dtype=torch.bool, device=device)
 
-        # First click: safe start
         r, c = first_click(boards, revealed, flagged)
         for i in range(pop_size):
             if boards[i, r[i], c[i]] == -1:
                 game_over[i] = True
 
         for step in range(max_steps):
-            r, c, action_type = cnn_agent(boards, revealed, flagged, genomes, H, W, hidden=hidden_dim)
+            r_list, c_list, action_type_list = [], [], []
+            for i, gnn in enumerate(gnn_list):
+                if game_over[i]:
+                    r_list.append(r[i])
+                    c_list.append(c[i])
+                    action_type_list.append(0)
+                    continue
+                ri, ci, ai = gnn_agent(gnn, boards[i:i+1], revealed[i:i+1], flagged[i:i+1], device)
+                r_list.append(int(ri[0].item()))
+                c_list.append(int(ci[0].item()))
+                action_type_list.append(int(ai[0].item()))
+            r = torch.tensor(r_list, device=device)
+            c = torch.tensor(c_list, device=device)
+            action_type = torch.tensor(action_type_list, device=device)
+
             for i in range(pop_size):
                 if game_over[i]:
                     continue
                 if action_type[i] == 0:
-                    # Reveal
                     if revealed[i, r[i], c[i]] or flagged[i, r[i], c[i]]:
                         invalid_action_count[i] += 1
                         continue
@@ -155,7 +190,6 @@ def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, e
                     else:
                         revealed[i, r[i], c[i]] = True
                 elif action_type[i] == 1:
-                    # Flag/unflag with strict flag limit
                     if revealed[i, r[i], c[i]] or game_over[i]:
                         invalid_action_count[i] += 1
                         continue
@@ -172,7 +206,6 @@ def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, e
                         else:
                             invalid_action_count[i] += 1
 
-                # Check win/flag overflow after every move
                 win, too_many_flags = check_win(
                     revealed[i].unsqueeze(0), flagged[i].unsqueeze(0), boards[i].unsqueeze(0), num_mines
                 )
@@ -187,7 +220,6 @@ def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, e
             if game_over.all():
                 break
 
-        # Final check for agents still running
         for i in range(pop_size):
             if not game_over[i]:
                 win, too_many_flags = check_win(
@@ -201,7 +233,6 @@ def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, e
                     wins[i] = 0.0
                     too_many_flags_vec[i] = True
 
-        # ---------- FITNESS CALCULATION ----------
         safe_cells_revealed = (
             revealed & (boards != -1)
         ).view(pop_size, -1).sum(1).float()
@@ -215,16 +246,15 @@ def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, e
         num_incorrect_flags = incorrect_flags.view(pop_size, -1).sum(1).float()
 
         fitness = (
-            wins * 100                                 # Large reward for winning
-            + 10 * progress                            # Reward for clearing safe cells
-            + 5 * mines_flaged                     # Reward for flagging mines
-            + 2 * num_correct_flags                    # Bonus for correct flags
-            - 5 * num_incorrect_flags                  # Penalty for incorrect flags
-            - 10 * too_many_flags_vec.float()          # Huge penalty for overflagging
-            - 4 * invalid_action_count.float()          # Penalty for invalid actions
+            wins * 100
+            + 10 * progress
+            + 5 * mines_flaged
+            + 2 * num_correct_flags
+            - 5 * num_incorrect_flags
+            - 10 * too_many_flags_vec.float()
+            - 4 * invalid_action_count.float()
         )
 
-        # Accumulate stats
         fitness_sum += fitness
         wins_sum += wins
         revealed_sum += revealed.float()
@@ -234,7 +264,6 @@ def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, e
         unflag_count_sum += unflag_count.float()
         too_many_flags_sum += too_many_flags_vec.float()
 
-    # Average stats over eval_games
     fitness_avg = fitness_sum / eval_games
     wins_avg = wins_sum / eval_games
     revealed_avg = revealed_sum.cpu().numpy() / eval_games
@@ -255,13 +284,18 @@ def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, e
         too_many_flags_avg
     )
 
-def mutate(pop, sigma=0.13):
-    return pop + sigma * torch.randn_like(pop)
+def mutate_state_dict(state_dict, sigma=0.15):
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        noise = torch.randn_like(v) * sigma
+        new_state_dict[k] = v + noise
+    return new_state_dict
 
-def crossover(parents):
-    idx = torch.randint(0, 2, parents[0].shape, device=parents[0].device).bool()
-    child = parents[0].clone()
-    child[idx] = parents[1][idx]
+def crossover_state_dict(sd1, sd2):
+    child = {}
+    for k in sd1.keys():
+        mask = torch.randint(0, 2, sd1[k].shape, device=sd1[k].device).bool()
+        child[k] = torch.where(mask, sd1[k], sd2[k])
     return child
 
 def evolutionary_loop(args):
@@ -269,21 +303,34 @@ def evolutionary_loop(args):
     print(f"Using device: {device}")
     pop_size = args.population_size
     H, W, num_mines, max_steps = args.height, args.width, args.num_mines, args.max_steps
-    hidden_dim = 16
-    genome_dim = 3*3*3*hidden_dim + hidden_dim + hidden_dim*hidden_dim*3*3 + hidden_dim + hidden_dim*2 + 2
+    hidden_dim = 32
+
     if getattr(args, "init_from_genome", None):
         print(f"Initializing population from {args.init_from_genome}")
-        best_genome = np.load(args.init_from_genome)
-        pop = torch.tensor(best_genome, dtype=torch.float32, device=device).unsqueeze(0).repeat(pop_size, 1)
-        pop += 0.1 * torch.randn_like(pop)
+        best_state_dict = torch.load(args.init_from_genome, map_location=device)
+        population = []
+        for i in range(pop_size):
+            if i == 0:
+                genome = {k: v.clone().to(device) for k, v in best_state_dict.items()}
+            else:
+                genome = mutate_state_dict(best_state_dict, sigma=0.13)
+                genome = {k: v.to(device) for k, v in genome.items()}
+            population.append(genome)
     else:
-        pop = torch.randn(pop_size, genome_dim, device=device) * 0.5
+        gnn_template = MinesweeperGNN(node_feat_dim=3, hidden_dim=hidden_dim).to(device)
+        template_state_dict = {k: v.clone().detach().to(device) for k, v in gnn_template.state_dict().items()}
+        population = []
+        for i in range(pop_size):
+            genome = mutate_state_dict(template_state_dict, sigma=0.5)
+            genome = {k: v.to(device) for k, v in genome.items()}
+            population.append(genome)
+
     best_fitness = -float('inf')
     best_genome = None
 
     for gen in range(args.generations):
         fitness, wins, revealed, correct_flags, incorrect_flags, invalid_actions, unflags, too_many_flags = run_generation(
-            pop, H, W, num_mines, max_steps, device, hidden_dim
+            population, H, W, num_mines, max_steps, device, hidden_dim
         )
         avg_fitness = fitness.mean().item()
         win_rate = wins.mean()
@@ -291,38 +338,47 @@ def evolutionary_loop(args):
         best_idx = np.argmax(fitness_np)
         if fitness_np[best_idx] > best_fitness:
             best_fitness = fitness_np[best_idx]
-            best_genome = pop[best_idx].detach().cpu().numpy()
+            best_genome = {k: v.cpu() for k, v in population[best_idx].items()}
         print(f"Gen {gen:03d}: Fitness {avg_fitness:.2f} | Win% {win_rate*100:.2f} | Best {fitness_np[best_idx]:.2f} | "
               f"Avg invalid actions {np.mean(invalid_actions):.2f} | Avg unflags {np.mean(unflags):.2f} | "
               f"Avg too many flags: {np.mean(too_many_flags):.3f}")
+
         idxs = torch.randint(0, pop_size, (pop_size, 2), device=device)
         fit0 = fitness[idxs[:, 0]]
         fit1 = fitness[idxs[:, 1]]
         winners = torch.where(fit0 >= fit1, idxs[:, 0], idxs[:, 1])
-        selected = pop[winners]
+        selected = [population[w.item()] for w in winners]
+
         children = []
         for i in range(0, pop_size, 2):
             if i+1 >= pop_size:
-                children.append(mutate(selected[i]))
+                child = mutate_state_dict(selected[i])
+                child = {k: v.to(device) for k, v in child.items()}
+                children.append(child)
             else:
-                child1 = crossover([selected[i], selected[i+1]])
-                child2 = crossover([selected[i+1], selected[i]])
-                children.append(mutate(child1))
-                children.append(mutate(child2))
-        pop = torch.stack(children)[:pop_size]
-    np.save(args.save_path, best_genome)
-    print(f"Best genome saved to {args.save_path}")
+                child1 = mutate_state_dict(crossover_state_dict(selected[i], selected[i+1]))
+                child2 = mutate_state_dict(crossover_state_dict(selected[i+1], selected[i]))
+                child1 = {k: v.to(device) for k, v in child1.items()}
+                child2 = {k: v.to(device) for k, v in child2.items()}
+                children.append(child1)
+                children.append(child2)
+        population = children[:pop_size]
+
+    if best_genome is not None:
+        torch.save(best_genome, args.save_path)
+        print(f"Best genome saved to {args.save_path}")
 
 def evaluate_genome(args):
     device = torch.device("cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
-    hidden_dim = 16
-    genome_dim = 3*3*3*hidden_dim + hidden_dim + hidden_dim*hidden_dim*3*3 + hidden_dim + hidden_dim*2 + 2
-    best_genome = np.load(args.eval_model)
+    hidden_dim = 32
+    best_state_dict = torch.load(args.eval_model, map_location=device)
     pop_size = args.eval_games
-    assert best_genome.shape[0] == genome_dim, "Genome shape mismatch"
-    genomes = torch.tensor(best_genome, dtype=torch.float32, device=device).unsqueeze(0).repeat(pop_size, 1)
+    population = []
+    for _ in range(pop_size):
+        genome = {k: v.clone().to(device) for k, v in best_state_dict.items()}
+        population.append(genome)
     fitness, wins, revealed, correct_flags, incorrect_flags, invalid_actions, unflags, too_many_flags = run_generation(
-        genomes, args.height, args.width, args.num_mines, args.max_steps, device, hidden_dim
+        population, args.height, args.width, args.num_mines, args.max_steps, device, hidden_dim
     )
     print(f"Evaluated {pop_size} games: Win rate: {wins.mean()*100:.2f}%, Avg revealed: {revealed.sum(axis=(1,2)).mean():.2f}, "
           f"Avg correct flags: {correct_flags.sum(axis=(1,2)).mean():.2f}, Avg incorrect flags: {incorrect_flags.sum(axis=(1,2)).mean():.2f}, "
@@ -333,14 +389,14 @@ def main():
     parser.add_argument("--height", type=int, default=8)
     parser.add_argument("--width", type=int, default=8)
     parser.add_argument("--num-mines", type=int, default=10)
-    parser.add_argument("--population-size", type=int, default=256)
-    parser.add_argument("--generations", type=int, default=30)
+    parser.add_argument("--population-size", type=int, default=32)
+    parser.add_argument("--generations", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=64)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save-path", type=str, default="best_genome_flagging_cnn.npy")
+    parser.add_argument("--save-path", type=str, default="best_gnn_model.pt")
     parser.add_argument("--init-from-genome", type=str, default=None)
     parser.add_argument("--eval-model", type=str, default=None)
-    parser.add_argument("--eval-games", type=int, default=1024)
+    parser.add_argument("--eval-games", type=int, default=128)
     args = parser.parse_args()
 
     if args.eval_model:

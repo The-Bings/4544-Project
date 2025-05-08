@@ -82,6 +82,10 @@ class Minesweeper:
             self.flagged.remove((row, col))
         else:
             self.flagged.add((row, col))
+        # After flagging/unflagging, check for win
+        if self.check_win():
+            self.game_over = True
+            self.win = True
 
     def get_state(self) -> dict:
         """Return all relevant info for AI (board size, revealed, flagged, board data)."""
@@ -109,7 +113,13 @@ class Minesweeper:
 
     def check_win(self) -> bool:
         total_cells = self.height * self.width
-        return len(self.revealed) == total_cells - self.num_mines
+        # Classic win: all safe revealed
+        all_safe_revealed = len(self.revealed) == total_cells - self.num_mines
+        # Flag win: all mines flagged, and no extra flags
+        mines_flagged = sum(1 for pos in self.flagged if self.board[pos[0]][pos[1]] == self.MINE)
+        no_extra_flags = len(self.flagged) <= self.num_mines
+        all_mines_flagged = (mines_flagged == self.num_mines) and no_extra_flags
+        return all_safe_revealed or all_mines_flagged
 
     # Text interface for debug/AI
     def print_board(self, reveal_all=False):
