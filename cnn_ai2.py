@@ -21,9 +21,7 @@ def first_click(boards, revealed, flagged):
     idxs = torch.randint(0, H*W, (pop_size,), device=boards.device)
     r = idxs // W
     c = idxs % W
-    for i in range(pop_size):
-        if not flagged[i, r[i], c[i]]:
-            revealed[i, r[i], c[i]] = True
+    revealed[torch.arange(pop_size), r, c] = True
     return r, c
 
 def cnn_agent_forward(obs, genomes, H, W, hidden=16):
@@ -95,30 +93,26 @@ def cnn_agent(boards, revealed, flagged, genomes, H, W, hidden=16):
 
 def check_win(revealed, flagged, boards, num_mines):
     is_mine = (boards == -1)
-    all_safe_revealed = revealed.sum(dim=[1,2]) == (boards.numel() // boards.shape[0]) - num_mines
+    all_safe_revealed = revealed.sum(dim=[1,2]) == (boards[0].numel() - num_mines)
     all_mines_flagged = (flagged & is_mine).sum(dim=[1,2]) == num_mines
     too_many_flags = flagged.sum(dim=[1,2]) > num_mines
     win = (all_safe_revealed | all_mines_flagged) & (~too_many_flags)
     return win, too_many_flags
 
 def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, eval_games=50):
-    """
-    For each genome, evaluate it on `eval_games` different random boards.
-    Accumulate fitness and win statistics.
-    """
     pop_size = genomes.shape[0]
     total_cells = H * W
     num_safe_cells = total_cells - num_mines
 
-    # Accumulators for all statistics
-    fitness_sum = torch.zeros(pop_size, dtype=torch.float32, device=device)
-    wins_sum = torch.zeros(pop_size, dtype=torch.float32, device=device)
-    revealed_sum = torch.zeros(pop_size, H, W, dtype=torch.float32, device=device)
-    correct_flags_sum = torch.zeros(pop_size, H, W, dtype=torch.float32, device=device)
-    incorrect_flags_sum = torch.zeros(pop_size, H, W, dtype=torch.float32, device=device)
-    invalid_action_count_sum = torch.zeros(pop_size, dtype=torch.float32, device=device)
-    unflag_count_sum = torch.zeros(pop_size, dtype=torch.float32, device=device)
-    too_many_flags_sum = torch.zeros(pop_size, dtype=torch.float32, device=device)
+    # Stats accumulators
+    fitness_sum = torch.zeros(pop_size, device=device)
+    wins_sum = torch.zeros(pop_size, device=device)
+    revealed_sum = torch.zeros(pop_size, H, W, device=device)
+    correct_flags_sum = torch.zeros(pop_size, H, W, device=device)
+    incorrect_flags_sum = torch.zeros(pop_size, H, W, device=device)
+    invalid_action_count_sum = torch.zeros(pop_size, device=device)
+    unflag_count_sum = torch.zeros(pop_size, device=device)
+    too_many_flags_sum = torch.zeros(pop_size, device=device)
 
     for k in range(eval_games):
         boards = setup_boards(pop_size, H, W, num_mines, device)
@@ -127,79 +121,85 @@ def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, e
         correct_flags = torch.zeros_like(boards, dtype=torch.bool)
         incorrect_flags = torch.zeros_like(boards, dtype=torch.bool)
         game_over = torch.zeros(pop_size, dtype=torch.bool, device=device)
-        wins = torch.zeros(pop_size, dtype=torch.float32, device=device)
-        invalid_action_count = torch.zeros(pop_size, dtype=torch.int32, device=device)
-        unflag_count = torch.zeros(pop_size, dtype=torch.int32, device=device)
+        wins = torch.zeros(pop_size, device=device)
+        invalid_action_count = torch.zeros(pop_size, device=device)
+        unflag_count = torch.zeros(pop_size, device=device)
         too_many_flags_vec = torch.zeros(pop_size, dtype=torch.bool, device=device)
 
-        # First click: safe start
+        # First click: safe start everywhere
         r, c = first_click(boards, revealed, flagged)
-        for i in range(pop_size):
-            if boards[i, r[i], c[i]] == -1:
-                game_over[i] = True
+        # If first click is a mine, game over
+        first_mine = boards[torch.arange(pop_size), r, c] == -1
+        game_over[first_mine] = True
 
         for step in range(max_steps):
+            # Get actions for all agents
             r, c, action_type = cnn_agent(boards, revealed, flagged, genomes, H, W, hidden=hidden_dim)
-            for i in range(pop_size):
-                if game_over[i]:
-                    continue
-                if action_type[i] == 0:
-                    # Reveal
-                    if revealed[i, r[i], c[i]] or flagged[i, r[i], c[i]]:
-                        invalid_action_count[i] += 1
-                        continue
-                    if boards[i, r[i], c[i]] == -1:
-                        game_over[i] = True
-                    else:
-                        revealed[i, r[i], c[i]] = True
-                elif action_type[i] == 1:
-                    # Flag/unflag with strict flag limit
-                    if revealed[i, r[i], c[i]] or game_over[i]:
-                        invalid_action_count[i] += 1
-                        continue
-                    if flagged[i, r[i], c[i]]:
-                        flagged[i, r[i], c[i]] = False
-                        unflag_count[i] += 1
-                    else:
-                        if flagged[i].sum() < num_mines:
-                            flagged[i, r[i], c[i]] = True
-                            if boards[i, r[i], c[i]] == -1:
-                                correct_flags[i, r[i], c[i]] = True
-                            else:
-                                incorrect_flags[i, r[i], c[i]] = True
-                        else:
-                            invalid_action_count[i] += 1
+            batch_idx = torch.arange(pop_size, device=device)
+            not_over = ~game_over
 
-                # Check win/flag overflow after every move
-                win, too_many_flags = check_win(
-                    revealed[i].unsqueeze(0), flagged[i].unsqueeze(0), boards[i].unsqueeze(0), num_mines
-                )
-                if win[0]:
-                    game_over[i] = True
-                    wins[i] = 1.0
-                elif too_many_flags[0]:
-                    game_over[i] = True
-                    wins[i] = 0.0
-                    too_many_flags_vec[i] = True
+            # Reveal actions
+            is_reveal = (action_type == 0) & not_over
+            reveal_valid = is_reveal & (~revealed[batch_idx, r, c]) & (~flagged[batch_idx, r, c])
+            # Invalid reveal: already revealed or flagged
+            invalid_reveal = is_reveal & ~reveal_valid
+            invalid_action_count[invalid_reveal] += 1
+            # Reveal action: is mine? End game; else reveal cell
+            reveal_mine = reveal_valid & (boards[batch_idx, r, c] == -1)
+            game_over[reveal_mine] = True
+            not_mine = reveal_valid & (~reveal_mine)
+            revealed[batch_idx[not_mine], r[not_mine], c[not_mine]] = True
+
+            # Flag/unflag actions
+            is_flag = (action_type == 1) & not_over
+            can_flag = is_flag & (~revealed[batch_idx, r, c])
+            # Invalid flag: on revealed or after game over
+            invalid_flag = is_flag & ~can_flag
+            invalid_action_count[invalid_flag] += 1
+
+            already_flagged = can_flag & flagged[batch_idx, r, c]
+            flagged[batch_idx[already_flagged], r[already_flagged], c[already_flagged]] = False
+            unflag_count[already_flagged] += 1
+
+            need_flag = can_flag & (~flagged[batch_idx, r, c])
+            # Only flag if flag count < num_mines
+            flag_count = flagged.sum(dim=[1,2])
+            can_really_flag = need_flag & (flag_count < num_mines)
+            flagged[batch_idx[can_really_flag], r[can_really_flag], c[can_really_flag]] = True
+            # Correct/incorrect flag bookkeeping
+            correct = can_really_flag & (boards[batch_idx, r, c] == -1)
+            incorrect = can_really_flag & (boards[batch_idx, r, c] != -1)
+            correct_flags[batch_idx[correct], r[correct], c[correct]] = True
+            incorrect_flags[batch_idx[incorrect], r[incorrect], c[incorrect]] = True
+            # Can't flag: used too many flags
+            cant_flag = need_flag & ~(flag_count < num_mines)
+            invalid_action_count[cant_flag] += 1
+
+            # Check win or flag overflow for all
+            win, too_many_flags = check_win(revealed, flagged, boards, num_mines)
+            just_won = win & (~game_over)
+            game_over[just_won] = True
+            wins[just_won] = 1.0
+            just_lost = too_many_flags & (~game_over)
+            game_over[just_lost] = True
+            wins[just_lost] = 0.0
+            too_many_flags_vec[just_lost] = True
 
             if game_over.all():
                 break
 
-        # Final check for agents still running
-        for i in range(pop_size):
-            if not game_over[i]:
-                win, too_many_flags = check_win(
-                    revealed[i].unsqueeze(0), flagged[i].unsqueeze(0), boards[i].unsqueeze(0), num_mines
-                )
-                if win[0]:
-                    game_over[i] = True
-                    wins[i] = 1.0
-                elif too_many_flags[0]:
-                    game_over[i] = True
-                    wins[i] = 0.0
-                    too_many_flags_vec[i] = True
+        # Final check for any unfinished games
+        still_running = ~game_over
+        if still_running.any():
+            win, too_many_flags = check_win(revealed, flagged, boards, num_mines)
+            just_won = win & still_running
+            just_lost = too_many_flags & still_running
+            game_over[just_won] = True
+            wins[just_won] = 1.0
+            game_over[just_lost] = True
+            wins[just_lost] = 0.0
+            too_many_flags_vec[just_lost] = True
 
-        # ---------- FITNESS CALCULATION ----------
         safe_cells_revealed = (
             revealed & (boards != -1)
         ).view(pop_size, -1).sum(1).float()
@@ -213,15 +213,14 @@ def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, e
         num_incorrect_flags = incorrect_flags.view(pop_size, -1).sum(1).float()
 
         fitness = (
-            wins * 1000                                 # Large reward for winning
-            + 5 * progress                            # Reward for clearing safe cells
-            + 50 * mines_flaged                     # Reward for flagging mines
-            + 10 * num_correct_flags                    # Bonus for correct flags
-            - 20 * num_incorrect_flags                  # Penalty for incorrect flags
-            - 100 * too_many_flags_vec.float()          # Huge penalty for overflagging
-            - 5 * invalid_action_count.float()          # Penalty for invalid actions
+            wins * 1000
+            + 5 * progress
+            + 50 * mines_flaged
+            + 10 * num_correct_flags
+            - 20 * num_incorrect_flags
+            - 100 * too_many_flags_vec.float()
+            - 5 * invalid_action_count.float()
         )
-
         # Accumulate stats
         fitness_sum += fitness
         wins_sum += wins
@@ -232,7 +231,7 @@ def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, e
         unflag_count_sum += unflag_count.float()
         too_many_flags_sum += too_many_flags_vec.float()
 
-    # Average stats over eval_games
+    # Average over eval_games
     fitness_avg = fitness_sum / eval_games
     wins_avg = wins_sum / eval_games
     revealed_avg = revealed_sum.cpu().numpy() / eval_games
@@ -253,7 +252,7 @@ def run_generation(genomes, H, W, num_mines, max_steps, device, hidden_dim=16, e
         too_many_flags_avg
     )
 
-def mutate(pop, sigma=0.15):
+def mutate(pop, sigma=0.1):
     return pop + sigma * torch.randn_like(pop)
 
 def crossover(parents):
